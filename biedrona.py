@@ -1,4 +1,4 @@
-
+# --- POCZĄTEK PEŁNEGO SKRYPTU (WERSJA 21 - PRAWDZIWA GALERIA) ---
 
 import requests
 from bs4 import BeautifulSoup
@@ -8,11 +8,11 @@ import pytesseract
 from io import BytesIO
 import os
 import threading
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv # Nowa biblioteka do bezpiecznych haseł
+from dotenv import load_dotenv
 
 # --- KONFIGURACJA ---
-# Ładujemy zmienne z pliku .env (jeśli istnieje)
 load_dotenv() 
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
@@ -21,7 +21,6 @@ KEYWORD_TO_FIND = "papier"
 SAVE_FOLDER = "gazetki"
 MAX_WORKERS = 5
 
-# Pobieramy URL bezpiecznie ze zmiennych środowiskowych
 DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 HEADERS = {
@@ -32,27 +31,98 @@ print_lock = threading.Lock()
 
 # --------------------
 
-def send_discord_notification(message, image_path):
-    """Wysyła powiadomienie na Discorda (tekst + zdjęcie)."""
-    if not DISCORD_URL:
-        return # Jeśli nie ma linku w .env, nic nie rób
-
+def compress_image_for_discord(image_path):
+    """Kompresuje obraz do JPG w pamięci RAM."""
     try:
-        data = {"content": message}
-        # Otwieramy plik w trybie binarnym do wysłania
-        with open(image_path, 'rb') as f:
-            files = {
-                "file": (os.path.basename(image_path), f)
-            }
-            response = requests.post(DISCORD_URL, data=data, files=files)
+        img = Image.open(image_path)
+        if img.mode in ("RGBA", "P"): 
+            img = img.convert("RGB")
             
-            # Sprawdzenie czy Discord przyjął wiadomość (kody 2xx są ok)
-            if response.status_code not in [200, 204]:
-                with print_lock:
-                    print(f"\n⚠️ Błąd wysyłania na Discorda: {response.status_code}")
+        if img.width > 2000:
+            ratio = 2000 / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((2000, new_height), Image.Resampling.LANCZOS)
+
+        buffer = BytesIO()
+        img.save(buffer, format="JPEG", quality=85)
+        buffer.seek(0)
+        return buffer
     except Exception as e:
-        with print_lock:
-            print(f"\n⚠️ Błąd funkcji Discorda: {e}")
+        print(f"Błąd kompresji: {e}")
+        return None
+
+def send_discord_gallery(found_files):
+    if not DISCORD_URL or not found_files:
+        return
+
+    # Discord pozwala na max 10 embedów w jednej wiadomości.
+    # Ustawiamy 4, żeby zdjęcia były duże i czytelne w siatce (2x2).
+    chunk_size = 4
+    chunks = [found_files[i:i + chunk_size] for i in range(0, len(found_files), chunk_size)]
+
+    print(f"\n📨 Wysyłam wyniki na Discorda w {len(chunks)} galeriach...")
+
+    for i, chunk in enumerate(chunks):
+        files = {}
+        embeds = []
+        buffers = []
+        
+        try:
+            # Budujemy strukturę wiadomości
+            for idx, file_path in enumerate(chunk):
+                compressed_img = compress_image_for_discord(file_path)
+                
+                if compressed_img:
+                    buffers.append(compressed_img)
+                    
+                    # Nazwa pliku dla Discorda (musi być unikalna w obrębie wiadomości)
+                    filename = f"img_{i}_{idx}.jpg"
+                    
+                    # Dodajemy plik do załączników
+                    files[filename] = (filename, compressed_img, "image/jpeg")
+                    
+                    # Dodajemy Embed, który odwołuje się do tego załącznika
+                    # To jest klucz do wyświetlania jako galeria!
+                    embed = {
+                        "url": "https://www.biedronka.pl/pl/gazetki", # Link po kliknięciu w tytuł
+                        "image": {
+                            "url": f"attachment://{filename}"
+                        }
+                    }
+                    
+                    # Dodajemy tytuł tylko do pierwszego zdjęcia w paczce, żeby nie śmiecić
+                    if idx == 0:
+                        embed["title"] = f"Znaleziono: {KEYWORD_TO_FIND} (Paczka {i+1})"
+                        embed["color"] = 5763719 # Zielony
+                    
+                    embeds.append(embed)
+
+            if not files:
+                continue
+
+            # Konstruujemy payload JSON
+            payload = {
+                "content": "", # Pusta treść, bo wszystko jest w embedach
+                "embeds": embeds
+            }
+            
+            # Wysyłamy multipart/form-data (pliki + JSON)
+            response = requests.post(
+                DISCORD_URL, 
+                data={"payload_json": json.dumps(payload)}, 
+                files=files
+            )
+            
+            if response.status_code not in [200, 204]:
+                print(f"⚠️ Błąd Discorda przy paczce {i+1}: {response.status_code} - {response.text}")
+            else:
+                print(f"   -> Wysłano galerię {i+1}")
+                
+        except Exception as e:
+            print(f"⚠️ Błąd wysyłania paczki: {e}")
+        finally:
+            for b in buffers:
+                b.close()
 
 def sanitize_filename(name):
     name = name.replace(" ", "_")
@@ -134,8 +204,7 @@ def process_page(task_data):
             with open(path, 'wb') as f:
                 f.write(content)
             
-            # Zwracamy więcej danych, żeby Main mógł wysłać Discorda
-            msg = f"🔥 ZNALEZIONO PROMOCJĘ! Gazetka: '{name}' (Str. {page})"
+            msg = f"🔥 ZNALEZIONO! {name} (Str. {page})"
             return True, msg, path 
         
         return False, None, None
@@ -147,20 +216,15 @@ def main():
     os.makedirs(SAVE_FOLDER, exist_ok=True)
     print("="*60)
     print(f"   START SYSTEMU WYSZUKIWANIA PROMOCJI: '{KEYWORD_TO_FIND}'")
-    print(f"   Folder zapisu: {os.path.abspath(SAVE_FOLDER)}")
     
     if DISCORD_URL:
-        print("   ✅ Wykryto konfigurację Discord Webhook.")
-    else:
-        print("   ℹ️ Brak konfiguracji Discord (plik .env). Powiadomienia wyłączone.")
-        
+        print("   ✅ Discord Webhook aktywny.")
+    
     print("="*60 + "\n")
 
-    # 1. Zbieranie ID
     uuids = get_all_leaflet_uuids()
     if not uuids: return
 
-    # 2. Zbieranie stron
     all_tasks = []
     print(f"\n📂 KROK 2: Przygotowuję listę stron do sprawdzenia:")
     for uuid in uuids:
@@ -173,7 +237,7 @@ def main():
     print(f"\n🚀 KROK 3: URUCHAMIAM TURBO SKANOWANIE ({MAX_WORKERS} wątki na raz)")
     
     processed = 0
-    found_count = 0
+    all_found_images_paths = []
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_task = {executor.submit(process_page, task): task for task in all_tasks}
@@ -191,20 +255,22 @@ def main():
             found, msg, saved_path = future.result()
             
             if found:
-                found_count += 1
+                all_found_images_paths.append(saved_path)
                 with print_lock:
                     print(f"\r{' '*100}\r", end="") 
                     print(msg)
                     print(f"   -> Zapisano: {saved_path}")
-                
-                # Wysyłanie na Discorda
-                if DISCORD_URL:
-                    discord_msg = f"🛒 **Znaleziono '{KEYWORD_TO_FIND}'!**\nGazetka: {task['leaflet_name']}\nStrona: {task['page_number']}"
-                    send_discord_notification(discord_msg, saved_path)
 
     print(f"\n\n{'='*60}")
     print(f"   KONIEC SKANOWANIA")
-    print(f"   Znaleziono {found_count} stron z frazą '{KEYWORD_TO_FIND}'.")
+    print(f"   Znaleziono łącznie: {len(all_found_images_paths)} stron z frazą '{KEYWORD_TO_FIND}'.")
+    
+    # KROK 4: Wysyłanie grupowe na Discorda (Galerie)
+    if DISCORD_URL and all_found_images_paths:
+        send_discord_gallery(all_found_images_paths)
+    elif DISCORD_URL and not all_found_images_paths:
+        print("   Brak wyników do wysłania na Discorda.")
+    
     print("="*60)
 
 if __name__ == "__main__":
