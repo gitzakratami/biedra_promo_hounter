@@ -1,9 +1,9 @@
-# --- POCZĄTEK PEŁNEGO SKRYPTU (WERSJA 22 - DYNAMICZNE PAKOWANIE) ---
+# --- POCZĄTEK PEŁNEGO SKRYPTU (WERSJA 23 - ZAAWANSOWANY OCR / DUAL SCAN) ---
 
 import requests
 from bs4 import BeautifulSoup
 import re
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance # Dodatkowe narzędzia do grafiki
 import pytesseract
 from io import BytesIO
 import os
@@ -17,14 +17,14 @@ load_dotenv()
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-KEYWORD_TO_FIND = "dada" 
+KEYWORD_TO_FIND = "dada" # Szukamy DADA
 SAVE_FOLDER = "gazetki"
 MAX_WORKERS = 5
 
 DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # Limit Discorda to 8MB. Ustawiamy 7.5MB jako bezpieczny margines.
 MAX_DISCORD_SIZE_BYTES = 7.5 * 1024 * 1024 
-MAX_DISCORD_FILES_COUNT = 50
+MAX_DISCORD_FILES_COUNT = 10
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -34,24 +34,41 @@ print_lock = threading.Lock()
 
 # --------------------
 
+def preprocess_image_for_ocr(img):
+    """
+    Przygotowuje obraz do czytania trudnych tekstów (np. biały na czerwonym).
+    Robi inwersję kolorów i mocny kontrast.
+    """
+    # 1. Konwersja na odcienie szarości
+    img = img.convert('L')
+    
+    # 2. Inwersja (Negatyw) - żeby białe napisy stały się czarne
+    # To kluczowe dla banerów "2+1 GRATIS" na czerwonym tle
+    img = ImageOps.invert(img)
+    
+    # 3. Zwiększenie kontrastu
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(2.0) # 2x większy kontrast
+    
+    # 4. Progowanie (Binaryzacja) - zamiana na czystą czerń i biel
+    # Wszystko co szare staje się białe, a ciemne czarne.
+    fn = lambda x : 255 if x > 128 else 0
+    img = img.point(fn, mode='1')
+    
+    return img
+
 def compress_image_for_discord(image_path):
-    """
-    Kompresuje obraz do JPG (jakość 75).
-    Zwraca obiekt BytesIO (plik w pamięci).
-    """
     try:
         img = Image.open(image_path)
         if img.mode in ("RGBA", "P"): 
             img = img.convert("RGB")
             
-        # Skalowanie w dół, jeśli obraz jest ogromny
         if img.width > 2000:
             ratio = 2000 / img.width
             new_height = int(img.height * ratio)
             img = img.resize((2000, new_height), Image.Resampling.LANCZOS)
 
         buffer = BytesIO()
-        # ZMNIEJSZONA JAKOŚĆ DO 75 (zgodnie z prośbą)
         img.save(buffer, format="JPEG", quality=75) 
         buffer.seek(0)
         return buffer
@@ -60,7 +77,6 @@ def compress_image_for_discord(image_path):
         return None
 
 def send_single_batch(files_dict, embeds_list, batch_num):
-    """Funkcja pomocnicza do wysłania jednej przygotowanej paczki."""
     try:
         payload = {
             "content": "",
@@ -88,50 +104,33 @@ def send_discord_gallery_dynamic(found_files):
 
     print(f"\n📦 Rozpoczynam inteligentne pakowanie {len(found_files)} zdjęć...")
 
-    # Zmienne tymczasowe dla aktualnej paczki
     current_batch_files = {}
     current_batch_embeds = []
     current_batch_size = 0
     current_batch_count = 0
-    
-    # Lista otwartych buforów do zamknięcia
     open_buffers = []
-    
     batch_counter = 1
 
     for idx, file_path in enumerate(found_files):
-        # 1. Kompresujemy plik
         compressed_img = compress_image_for_discord(file_path)
         if not compressed_img:
             continue
             
-        # 2. Sprawdzamy jego rozmiar w bajtach
         img_size = compressed_img.getbuffer().nbytes
         
-        # 3. SPRAWDZAMY CZY MIEŚCI SIĘ W AKTUALNEJ PACZCE
-        # Warunki:
-        # A. Czy dodanie pliku nie przekroczy 7.5 MB?
-        # B. Czy liczba plików nie przekroczy 10?
         if (current_batch_size + img_size > MAX_DISCORD_SIZE_BYTES) or (current_batch_count >= MAX_DISCORD_FILES_COUNT):
-            
-            # JEŚLI SIĘ NIE MIEŚCI -> Wysyłamy obecną paczkę
             send_single_batch(current_batch_files, current_batch_embeds, batch_counter)
             
-            # Czyścimy zmienne pod nową paczkę
             batch_counter += 1
             current_batch_files = {}
             current_batch_embeds = []
             current_batch_size = 0
             current_batch_count = 0
             
-            # Zamykamy bufory z poprzedniej paczki (ważne dla pamięci RAM)
-            for b in open_buffers:
-                b.close()
+            for b in open_buffers: b.close()
             open_buffers = []
 
-        # 4. Dodajemy plik do (obecnej lub nowej) paczki
         open_buffers.append(compressed_img)
-        
         filename = f"img_{batch_counter}_{idx}.jpg"
         current_batch_files[filename] = (filename, compressed_img, "image/jpeg")
         
@@ -140,7 +139,6 @@ def send_discord_gallery_dynamic(found_files):
             "image": {"url": f"attachment://{filename}"}
         }
         
-        # Tytuł tylko przy pierwszym elemencie w paczce
         if current_batch_count == 0:
             embed["title"] = f"Znaleziono: {KEYWORD_TO_FIND} (Paczka {batch_counter})"
             embed["color"] = 5763719
@@ -149,11 +147,9 @@ def send_discord_gallery_dynamic(found_files):
         current_batch_size += img_size
         current_batch_count += 1
 
-    # 5. Na koniec pętli wysyłamy to, co zostało (ostatnia, niedopełniona paczka)
     if current_batch_files:
         send_single_batch(current_batch_files, current_batch_embeds, batch_counter)
-        for b in open_buffers:
-            b.close()
+        for b in open_buffers: b.close()
 
 def sanitize_filename(name):
     name = name.replace(" ", "_")
@@ -167,7 +163,6 @@ def get_all_leaflet_uuids():
     try:
         response = requests.get(main_page_url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
-        
         leaflet_links = soup.find_all('a', href=re.compile(r'/pl/press,id,'))
         unique_links = list(set([link.get('href') for link in leaflet_links]))
         
@@ -187,9 +182,7 @@ def get_all_leaflet_uuids():
                     long_ids.add(match.group(1))
             except:
                 pass
-        
         return list(long_ids)
-
     except Exception as e:
         print(f"❌ Błąd krytyczny: {e}")
         return []
@@ -199,10 +192,8 @@ def get_leaflet_pages(leaflet_id):
         api_url = f"https://leaflet-api.prod.biedronka.cloud/api/leaflets/{leaflet_id}?ctx=web"
         response = requests.get(api_url, headers=HEADERS, timeout=10)
         data = response.json()
-        
         pages_info = []
         name = data.get('name', f'Gazetka_{leaflet_id}')
-        
         for page_data in data.get('images_desktop', []):
             valid_images = [img for img in page_data.get('images', []) if img]
             if valid_images:
@@ -224,10 +215,20 @@ def process_page(task_data):
         resp = requests.get(url, headers=HEADERS, timeout=15)
         content = resp.content
         
+        # 1. Wczytujemy oryginał
         img = Image.open(BytesIO(content))
-        text = pytesseract.image_to_string(img, lang='pol')
         
-        if KEYWORD_TO_FIND.lower() in text.lower():
+        # 2. OCR nr 1: Normalny skan
+        text_normal = pytesseract.image_to_string(img, lang='pol')
+        
+        # 3. OCR nr 2: Skan przetworzony (dla białego tekstu na czerwonym tle)
+        img_processed = preprocess_image_for_ocr(img)
+        text_inverted = pytesseract.image_to_string(img_processed, lang='pol')
+        
+        # 4. Łączymy oba teksty
+        combined_text = text_normal + " " + text_inverted
+        
+        if KEYWORD_TO_FIND.lower() in combined_text.lower():
             safe_name = sanitize_filename(name)
             filename = f"{safe_name}_strona_{page}.png"
             path = os.path.join(SAVE_FOLDER, filename)
@@ -266,9 +267,11 @@ def main():
     
     total_pages = len(all_tasks)
     print(f"\n🚀 KROK 3: URUCHAMIAM TURBO SKANOWANIE ({MAX_WORKERS} wątki na raz)")
+    print("   (Używam podwójnego skanowania dla trudnych teł...)")
     
     processed = 0
     all_found_images_paths = []
+    found_count = 0
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_task = {executor.submit(process_page, task): task for task in all_tasks}
@@ -286,6 +289,7 @@ def main():
             found, msg, saved_path = future.result()
             
             if found:
+                found_count += 1
                 all_found_images_paths.append(saved_path)
                 with print_lock:
                     print(f"\r{' '*100}\r", end="") 
@@ -296,7 +300,6 @@ def main():
     print(f"   KONIEC SKANOWANIA")
     print(f"   Znaleziono łącznie: {len(all_found_images_paths)} stron z frazą '{KEYWORD_TO_FIND}'.")
     
-    # KROK 4: Wysyłanie dynamiczne na Discorda
     if DISCORD_URL and all_found_images_paths:
         send_discord_gallery_dynamic(all_found_images_paths)
     elif DISCORD_URL and not all_found_images_paths:
