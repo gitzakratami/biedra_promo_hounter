@@ -1,6 +1,6 @@
 {
   "name": "biedronka-promo-hunter",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Wyszukiwarka promocji w gazetkach Biedronki",
   "author": {
     "name": "krata",
@@ -8,40 +8,9 @@
   },
   "main": "main.js",
   "scripts": {
-    "start": "electron .",
-    "build:linux": "electron-builder --linux",
-    "build:win": "electron-builder --win"
-  },
-  "build": {
-    "appId": "com.biedronka.promohunter",
-    "productName": "Biedronka Promo Hunter",
-    "files": [
-      "main.js",
-      "preload.js",
-      "renderer/**/*"
-    ],
-    "extraResources": [
-      {
-        "from": "python_dist/",
-        "to": "python_dist",
-        "filter": ["**/*"]
-      },
-      {
-        "from": "tesseract_dist/",
-        "to": "tesseract_dist",
-        "filter": ["**/*"]
-      }
-    ],
-    "linux": {
-      "target": ["AppImage"],
-      "category": "Utility"
-    },
-    "win": {
-      "target": "portable"
-    }
+    "start": "electron ."
   },
   "devDependencies": {
-    "electron": "^33.0.0",
-    "electron-builder": "^25.1.8"
+    "electron": "^33.0.0"
   }
 }

@@ -2,96 +2,77 @@
 
 BiedraBOT — wyszukiwarka promocji w gazetkach Biedronki z OCR.
 
-## Uruchamianie (tryb deweloperski)
+Aplikacja desktopowa (Electron + Python) uruchamiana lokalnie. Nie jest pakowana
+do `.exe` ani do AppImage — odpalasz ją z katalogu projektu.
 
-```bash
-npm install
-npm start
-```
+## Jak to działa
 
-Wymaga zainstalowanego Pythona 3 i Tesseracta w systemie.
+- **Indekser** (`biedrona.py --serve`) startuje razem z aplikacją, sprawdza jakie
+  gazetki są aktualnie na stronie i OCR-uje w tle strony, których nie ma jeszcze
+  w indeksie. Postęp widać na pasku na dole okna.
+- **Wyszukiwanie** działa od pierwszej sekundy na tym, co już jest w indeksie.
+  Wyniki dopisują się na żywo w miarę postępu OCR-u. Koszt OCR jest za stronę,
+  nie za hasło, więc kolejne wyszukiwania są natychmiastowe.
+- **Lista haseł** — wpisujesz swoje produkty raz, zapisują się w `config.json`
+  i po zakończeniu indeksowania widzisz wszystkie trafienia naraz.
 
-## Budowanie
+## Silnik OCR
 
-### Wymagania wspólne
+RapidOCR (ONNX Runtime) z modelem rozpoznawania `latin_PP-OCRv5_mobile_rec`,
+który obejmuje polskie znaki. Model (8 MB) dociąga się sam przy pierwszym
+uruchomieniu do katalogu `models/`.
+
+Domyślnie liczy na GPU przez **DirectML**, z automatycznym fallbackiem na CPU.
+Przełącznik GPU/CPU jest w zakładce Ustawienia — zmiana restartuje indekser.
+Rząd wielkości dla strony 1146x1800 na typowym desktopie:
+
+| | s/strona | pełny indeks (~366 stron) |
+|---|---|---|
+| DirectML | 0,36 | ~4 min z pobieraniem |
+| CPU | 1,28 | ~10 min |
+
+Wynik rozpoznawania jest w obu przypadkach identyczny. `--cpu` wymusza CPU.
+
+Tekst i pozycje trafień lądują w `ocr_cache.db` (SQLite + FTS5, tokenizer
+`unicode61 remove_diacritics 2`). Zapytania są prefiksowe, więc „mleko" znajduje
+też „mleka" i „mlekiem". Nieaktualne gazetki są usuwane z indeksu automatycznie.
+
+## Wymagania
 
 - **Node.js** 18+
 - **Python** 3.10+
-- **pip** z pakietami z `requirements.txt` (`pip install -r requirements.txt`)
-- **PyInstaller** (`pip install pyinstaller`)
 
----
-
-### Linux
-
-#### Dodatkowe wymagania
+## Instalacja
 
 ```bash
-sudo apt install tesseract-ocr tesseract-ocr-pol
+npm install
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install --force-reinstall onnxruntime-directml
 ```
 
-#### Budowanie
+Ostatnia linia jest istotna: `rapidocr-onnxruntime` ciągnie zwykłe
+`onnxruntime` jako zależność, a oba pakiety dostarczają ten sam moduł.
+`onnxruntime-directml` musi je nadpisać, inaczej GPU nie zostanie użyte.
+
+Aplikacja szuka Pythona najpierw w `.venv/`, potem w systemie.
+
+## Uruchamianie
 
 ```bash
-./scripts/build-linux.sh
+npm start
 ```
 
-Skrypt automatycznie:
-1. Kompiluje `biedrona.py` do binarki przez PyInstaller → `python_dist/`
-2. Kopiuje Tesseracta z bibliotekami + `pol.traineddata` → `tesseract_dist/`
-3. Instaluje zależności npm
-4. Buduje aplikację Electron (`AppImage`)
+## Tryby z linii poleceń
 
-Wynik w katalogu `dist/`.
-
----
-
-### Windows
-
-#### Dodatkowe wymagania
-
-- **Tesseract OCR** — zainstaluj z [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki)
-  - Podczas instalacji zaznacz język **Polski**
-  - Domyślna ścieżka: `C:\Program Files\Tesseract-OCR\`
-
-#### Budowanie
-
-```bat
-scripts\build-windows.bat
+```bash
+.venv\Scripts\python biedrona.py --index    # zindeksuj wszystko i zakończ
+.venv\Scripts\python biedrona.py --serve    # tryb GUI, komendy JSON na stdin
+.venv\Scripts\python biedrona.py            # stary interaktywny tryb konsolowy
 ```
 
-Skrypt automatycznie:
-1. Kompiluje `biedrona.py` do `.exe` przez PyInstaller → `python_dist\`
-2. Kopiuje Tesseracta + DLL-e + `pol.traineddata` → `tesseract_dist\`
-3. Instaluje zależności npm
-4. Buduje portable `.exe` (bez instalacji)
+## Discord
 
-Wynik w katalogu `dist\`.
-
----
-
-### GitHub Actions (automatycznie)
-
-Nie trzeba nic instalować. GitHub sam zbuduje aplikację na Windows i Linux.
-
-1. Push na `main`:
-   ```bash
-   git add -A && git commit -m "build" && git push
-   ```
-2. Wejdź na GitHub → zakładka **Actions** → **Build** → kliknij **"Run workflow"**
-3. Opcjonalnie wpisz wersję (np. `1.1.0`) — domyślnie bierze z package.json
-4. Poczekaj ~5-10 min
-5. Po zakończeniu w zakładce **Releases** pojawi się nowa wersja z plikami:
-   - `Biedra-Promo-Hunter-{wersja}-Windows-x86_64.exe`
-   - `Biedra-Promo-Hunter-{wersja}-Linux-x86_64.AppImage`
-
----
-
-## OCR cache
-
-Skrypt zapisuje wyniki OCR do lokalnej bazy `ocr_cache.db` (SQLite + FTS5).
-
-- strona gazetki jest OCR-owana tylko raz,
-- przy kolejnych uruchomieniach wyszukiwanie słowa odbywa się po indeksie,
-- OCR wykonywany jest tylko dla nowych stron, których nie ma jeszcze w cache.
-- nieaktualne gazetki są automatycznie usuwane z cache i nie są brane pod uwagę.
+Webhook ustawiasz w zakładce Ustawienia albo w `.env`
+(`DISCORD_WEBHOOK_URL=...`). Wysyłka jest ręczna — przycisk „Wyślij na
+Discorda" w widoku wyników.

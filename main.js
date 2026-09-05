@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, protocol, net, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, protocol, net, nativeImage, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execSync } = require('child_process');
@@ -6,10 +6,8 @@ const { spawn, execSync } = require('child_process');
 let mainWindow;
 let pythonProcess = null;
 
-// In packaged mode, user data (config, cache, gazetki) goes to userData dir
-// In dev mode, everything stays in __dirname
 function getDataDir() {
-  return app.isPackaged ? app.getPath('userData') : __dirname;
+  return __dirname;
 }
 
 function getConfigPath() {
@@ -23,15 +21,20 @@ function loadConfig() {
       return JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
     }
   } catch {}
-  return { discordWebhookUrl: '', discordEnabled: false };
+  return { discordWebhookUrl: '', discordEnabled: false, keywords: [] };
 }
 
 function saveConfig(config) {
   fs.writeFileSync(getConfigPath(), JSON.stringify(config, null, 2), 'utf-8');
 }
 
-// Detect Python command
+// Prefer the project venv — it holds onnxruntime-directml and rapidocr.
 function getPythonCmd() {
+  const venv = process.platform === 'win32'
+    ? path.join(__dirname, '.venv', 'Scripts', 'python.exe')
+    : path.join(__dirname, '.venv', 'bin', 'python');
+  if (fs.existsSync(venv)) return venv;
+
   for (const cmd of ['python3', 'python']) {
     try {
       execSync(`${cmd} --version`, { stdio: 'ignore' });
@@ -41,17 +44,10 @@ function getPythonCmd() {
   return null;
 }
 
-// Register custom protocol for serving local images
 protocol.registerSchemesAsPrivileged([
   {
-    scheme: 'local-image',
-    privileges: {
-      bypassCSP: true,
-      stream: true,
-      supportFetchAPI: true,
-      standard: true,
-      secure: true,
-    },
+    scheme: 'page-thumb',
+    privileges: { bypassCSP: true, stream: true, supportFetchAPI: true, standard: true, secure: true },
   },
 ]);
 
@@ -62,7 +58,6 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     frame: false,
-    transparent: false,
     backgroundColor: '#ffffff',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -73,7 +68,12 @@ function createWindow() {
 
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
-  // Allow opening DevTools with Ctrl+Shift+I (also in packaged builds for debugging)
+  // Renderer errors are invisible otherwise — surface them in the terminal.
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    const where = sourceId ? `${sourceId.split('/').pop()}:${line}` : '';
+    console.log(`[renderer:${level}] ${message} ${where}`);
+  });
+
   mainWindow.webContents.on('before-input-event', (_event, input) => {
     if (input.control && input.shift && input.key.toLowerCase() === 'i') {
       mainWindow.webContents.toggleDevTools();
@@ -81,170 +81,162 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
-  // Handle local-image:// protocol with optional thumbnail resizing
-  // Usage: local-image:///path/to/image?thumb=300 for 300px wide thumbnail
-  protocol.handle('local-image', (request) => {
-    let url = request.url.replace('local-image://', '');
-    let thumbWidth = 0;
-    const qIdx = url.indexOf('?thumb=');
-    if (qIdx !== -1) {
-      thumbWidth = parseInt(url.substring(qIdx + 7), 10) || 0;
-      url = url.substring(0, qIdx);
-    }
-    let filePath = decodeURIComponent(url);
-    if (!filePath.startsWith('/') && process.platform !== 'win32') {
-      filePath = '/' + filePath;
-    }
+// Leaflet pages are ~1.9 MB each, far too heavy for a grid of thumbnails.
+// Fetch once, downscale, and keep the JPEG in memory for the session.
+const thumbCache = new Map();
 
-    if (thumbWidth > 0) {
-      try {
-        const img = nativeImage.createFromPath(filePath);
-        const size = img.getSize();
-        if (size.width > thumbWidth) {
-          const ratio = thumbWidth / size.width;
-          const resized = img.resize({
-            width: thumbWidth,
-            height: Math.round(size.height * ratio),
-            quality: 'good',
-          });
-          const jpegBuffer = resized.toJPEG(70);
-          return new Response(jpegBuffer, {
-            headers: { 'Content-Type': 'image/jpeg' },
-          });
-        }
-      } catch (e) {
-        // Fallback to full image on error
-      }
-    }
+async function handleThumbRequest(request) {
+  const url = new URL(request.url);
+  const remote = url.searchParams.get('u');
+  const width = parseInt(url.searchParams.get('w'), 10) || 300;
+  if (!remote || !/^https:\/\//.test(remote)) {
+    return new Response('', { status: 400 });
+  }
+  const key = `${remote}|${width}`;
 
-    return net.fetch('file://' + encodeURI(filePath));
+  const cached = thumbCache.get(key);
+  if (cached) {
+    return new Response(cached, { headers: { 'Content-Type': 'image/jpeg' } });
+  }
+
+  try {
+    const response = await net.fetch(remote);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    let img = nativeImage.createFromBuffer(buffer);
+    const size = img.getSize();
+    if (size.width > width) {
+      img = img.resize({
+        width,
+        height: Math.round((size.height * width) / size.width),
+        quality: 'good',
+      });
+    }
+    const jpeg = img.toJPEG(72);
+    thumbCache.set(key, jpeg);
+    return new Response(jpeg, { headers: { 'Content-Type': 'image/jpeg' } });
+  } catch (e) {
+    return new Response('', { status: 502 });
+  }
+}
+
+// === Python indexer process ===
+
+function sendEvent(event) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('search-event', event);
+  }
+}
+
+function startPython() {
+  if (pythonProcess) return;
+
+  const pythonCmd = getPythonCmd();
+  if (!pythonCmd) {
+    sendEvent({ type: 'error', message: 'Nie znaleziono Pythona. Utwórz .venv i zainstaluj requirements.txt.' });
+    return;
+  }
+
+  const config = loadConfig();
+  const env = { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' };
+  env.BIEDRONA_DATA_DIR = getDataDir();
+  if (config.discordWebhookUrl) {
+    env.DISCORD_WEBHOOK_URL = config.discordWebhookUrl;
+  }
+
+  pythonProcess = spawn(pythonCmd, ['-u', path.join(__dirname, 'biedrona.py'), '--serve'], {
+    cwd: getDataDir(),
+    env,
   });
 
+  let buffer = '';
+  pythonProcess.stdout.on('data', (data) => {
+    buffer += data.toString('utf-8');
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('JSON:')) continue;
+      try {
+        sendEvent(JSON.parse(line.slice(5)));
+      } catch {}
+    }
+  });
+
+  let stderrTail = '';
+  pythonProcess.stderr.on('data', (data) => {
+    const text = data.toString();
+    console.error('[Python]', text);
+    stderrTail = (stderrTail + text).slice(-2000);
+  });
+
+  pythonProcess.on('close', (code) => {
+    pythonProcess = null;
+    if (code !== 0 && code !== null) {
+      sendEvent({
+        type: 'error',
+        message: `Indekser zakończył się z kodem ${code}.\n${stderrTail.trim().slice(-600)}`,
+      });
+    }
+    sendEvent({ type: 'process-ended', code });
+  });
+}
+
+function sendCommand(command) {
+  if (!pythonProcess) {
+    sendEvent({ type: 'error', message: 'Indekser nie działa.' });
+    return false;
+  }
+  pythonProcess.stdin.write(JSON.stringify(command) + '\n');
+  return true;
+}
+
+app.whenReady().then(() => {
+  protocol.handle('page-thumb', handleThumbRequest);
   createWindow();
 });
 
 app.on('window-all-closed', () => {
   if (pythonProcess) {
+    sendCommand({ cmd: 'quit' });
     pythonProcess.kill();
   }
   app.quit();
 });
 
-// === IPC Handlers ===
+// === IPC ===
 
-ipcMain.handle('start-search', async (_event, { keyword, discordEnabled }) => {
-  if (pythonProcess) {
-    pythonProcess.kill();
-    pythonProcess = null;
-  }
-
-  const dataDir = getDataDir();
-  let spawnCmd, spawnArgs;
-
-  if (app.isPackaged) {
-    // Packaged mode — use PyInstaller binary from extraResources
-    const ext = process.platform === 'win32' ? '.exe' : '';
-    const binaryPath = path.join(process.resourcesPath, 'python_dist', 'biedrona' + ext);
-
-    if (!fs.existsSync(binaryPath)) {
-      mainWindow.webContents.send('search-event', {
-        type: 'error',
-        message: 'Nie znaleziono silnika wyszukiwania (biedrona binary).',
-      });
-      mainWindow.webContents.send('search-event', { type: 'done', found_count: 0 });
-      return;
-    }
-
-    spawnCmd = binaryPath;
-    spawnArgs = ['--gui', '--keyword', keyword];
-  } else {
-    // Dev mode — use system Python
-    const pythonCmd = getPythonCmd();
-    if (!pythonCmd) {
-      mainWindow.webContents.send('search-event', {
-        type: 'error',
-        message: 'Python nie został znaleziony. Zainstaluj Python 3.',
-      });
-      mainWindow.webContents.send('search-event', { type: 'done', found_count: 0 });
-      return;
-    }
-
-    const scriptPath = path.join(__dirname, 'biedrona.py');
-    spawnCmd = pythonCmd;
-    spawnArgs = ['-u', scriptPath, '--gui', '--keyword', keyword];
-  }
-
-  const config = loadConfig();
-  const envVars = { ...process.env, PYTHONUNBUFFERED: '1' };
-
-  // Tell the Python process where to store data (gazetki, cache)
-  envVars.BIEDRONA_DATA_DIR = dataDir;
-
-
-  if (discordEnabled && config.discordWebhookUrl) {
-    spawnArgs.push('--discord');
-    envVars.DISCORD_WEBHOOK_URL = config.discordWebhookUrl;
-  }
-
-  pythonProcess = spawn(spawnCmd, spawnArgs, {
-    cwd: dataDir,
-    env: envVars,
-  });
-
-  let buffer = '';
-
-  pythonProcess.stdout.on('data', (data) => {
-    buffer += data.toString('utf-8');
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // keep incomplete line
-
-    for (const line of lines) {
-      if (line.startsWith('JSON:')) {
-        try {
-          const evt = JSON.parse(line.slice(5));
-          mainWindow.webContents.send('search-event', evt);
-        } catch (e) {
-          // ignore malformed JSON
-        }
-      }
-    }
-  });
-
-  let stderrBuffer = '';
-
-  pythonProcess.stderr.on('data', (data) => {
-    const text = data.toString();
-    console.error('[Python]', text);
-    stderrBuffer += text;
-  });
-
-  pythonProcess.on('close', (code) => {
-    // Flush remaining buffer
-    if (buffer.startsWith('JSON:')) {
-      try {
-        const evt = JSON.parse(buffer.slice(5));
-        mainWindow.webContents.send('search-event', evt);
-      } catch {}
-    }
-    // If process crashed or ended unexpectedly, send error with stderr details
-    if (code !== 0 && code !== null) {
-      const details = stderrBuffer.trim().slice(-800);
-      mainWindow.webContents.send('search-event', {
-        type: 'error',
-        message: `Silnik wyszukiwania zakończył się z kodem ${code}.${details ? '\n' + details : ''}`,
-      });
-    }
-    pythonProcess = null;
-    mainWindow.webContents.send('search-event', { type: 'process-ended', code, stderr: stderrBuffer.trim().slice(-1000) });
-  });
+ipcMain.handle('start-engine', async () => {
+  startPython();
+  return true;
 });
 
-ipcMain.handle('stop-search', async () => {
-  if (pythonProcess) {
-    pythonProcess.kill();
-    pythonProcess = null;
+ipcMain.handle('search', async (_event, keyword) => sendCommand({ cmd: 'search', keyword }));
+
+ipcMain.handle('search-many', async (_event, keywords) => sendCommand({ cmd: 'search-many', keywords }));
+
+ipcMain.handle('save-hit', async (_event, hit) => sendCommand({ cmd: 'save', ...hit }));
+
+ipcMain.handle('send-discord', async (_event, { keyword, hits }) => {
+  const config = loadConfig();
+  if (!config.discordWebhookUrl) {
+    sendEvent({ type: 'error', message: 'Brak webhooka Discorda w ustawieniach.' });
+    return false;
   }
+  return sendCommand({ cmd: 'discord', keyword, hits, webhook: config.discordWebhookUrl });
+});
+
+ipcMain.handle('index-status', async () => sendCommand({ cmd: 'status' }));
+
+ipcMain.handle('reindex', async () => sendCommand({ cmd: 'reindex' }));
+
+ipcMain.handle('clear-cache', async () => {
+  thumbCache.clear();
+  return sendCommand({ cmd: 'reset' });
+});
+
+ipcMain.handle('open-folder', async () => {
+  const dir = path.join(getDataDir(), 'gazetki');
+  fs.mkdirSync(dir, { recursive: true });
+  shell.openPath(dir);
 });
 
 ipcMain.handle('load-config', async () => loadConfig());

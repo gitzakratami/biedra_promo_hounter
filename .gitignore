@@ -222,3 +222,7 @@ __marimo__/
 ocr_cache.db
 ocr_cache.db
 ocr_cache.db
+models/
+ocr_cache.db-wal
+ocr_cache.db-shm
+config.json
