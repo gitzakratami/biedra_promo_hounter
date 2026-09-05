@@ -61,56 +61,31 @@
             </svg>
             <input type="text" id="search-input" placeholder="np. mleko, masło, chleb..." autocomplete="off" spellcheck="false">
             <button class="search-btn" id="search-btn">
-              <span class="btn-text">Szukaj</span>
+              <span class="btn-text">Dodaj</span>
               <svg class="btn-arrow" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
                 <line x1="3" y1="8" x2="13" y2="8"/><polyline points="9,4 13,8 9,12"/>
               </svg>
             </button>
           </div>
+          <div class="chips" id="keyword-chips"></div>
         </div>
     </div>
       <div class="features-bar">
         <div class="feature-item">
-          <span>Wielowątkowy OCR</span>
+          <span>OCR na GPU (DirectML)</span>
         </div>
         <div class="feature-dot"></div>
         <div class="feature-item">
-          <span>Inteligentny Cache</span>
+          <span>PP-OCRv5 latin</span>
         </div>
         <div class="feature-dot"></div>
         <div class="feature-item">
-          <span>Dual-Scan Engine</span>
+          <span>Indeks FTS5</span>
         </div>
         <div class="feature-dot"></div>
         <div class="feature-item">
           <span>Discord Webhook</span>
         </div>
-      </div>
-    </section>
-
-    <!-- Progress Section -->
-    <section class="section section-progress" id="section-progress">
-      <div class="progress-content">
-        <div class="progress-sphere-container">
-          <div class="progress-ring">
-            <svg class="ring-svg" viewBox="0 0 120 120">
-              <circle class="ring-bg" cx="60" cy="60" r="52"/>
-              <circle class="ring-fill" cx="60" cy="60" r="52" id="progress-ring-fill"/>
-            </svg>
-            <span class="progress-percent" id="progress-percent">0%</span>
-          </div>
-        </div>
-        <h2 class="progress-title" id="progress-title">Skanowanie gazetek...</h2>
-        <p class="progress-detail" id="progress-detail">Inicjalizacja...</p>
-        <div class="progress-bar-container">
-          <div class="progress-bar">
-            <div class="progress-bar-fill" id="progress-bar-fill"></div>
-          </div>
-        </div>
-        <button class="stop-btn" id="stop-btn">
-          <svg viewBox="0 0 16 16" fill="currentColor"><rect x="3" y="3" width="10" height="10" rx="2"/></svg>
-          Zatrzymaj
-        </button>
       </div>
     </section>
 
@@ -120,12 +95,26 @@
         <h2 class="results-title">
           <span class="gradient-text" id="results-count">0</span> wyników dla &bdquo;<span id="results-keyword"></span>&rdquo;
         </h2>
-        <button class="new-search-btn" id="new-search-btn">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="4,8 1,8 1,1 8,1 8,4"/><line x1="6" y1="10" x2="15" y2="1"/>
-          </svg>
-          Nowe wyszukiwanie
-        </button>
+        <div class="results-actions">
+          <button class="new-search-btn" id="discord-btn">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M2 12l12-9-4 12-3-4-5 1z"/>
+            </svg>
+            Wyślij na Discorda
+          </button>
+          <button class="new-search-btn" id="folder-btn">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M1 4h5l1.5 2H15v7H1z"/>
+            </svg>
+            Folder
+          </button>
+          <button class="new-search-btn" id="new-search-btn">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="4,8 1,8 1,1 8,1 8,4"/><line x1="6" y1="10" x2="15" y2="1"/>
+            </svg>
+            Nowe wyszukiwanie
+          </button>
+        </div>
       </div>
       <div class="gallery-grid" id="gallery-grid">
         <!-- Cards injected by JS -->
@@ -172,11 +161,22 @@
         </div>
 
         <div class="settings-card" style="animation-delay: 0.25s">
+          <div class="settings-card-title">Cache OCR</div>
+          <div class="settings-card-desc">Czyszczenie usuwa cały indeks OCR i zapisane strony gazetek, i na tym kończy. Indeksowanie ruszy przy następnym starcie aplikacji albo po kliknięciu „Indeksuj teraz" (~4 min na GPU). Model OCR zostaje.</div>
+          <div class="settings-row" style="gap: 8px;">
+            <span class="settings-row-label" id="cache-info">Indeks: — stron</span>
+            <button class="settings-save-btn" id="reindex-btn">Indeksuj teraz</button>
+            <button class="settings-save-btn" id="cache-clear-btn">Wyczyść cache</button>
+          </div>
+          <div class="settings-status" id="cache-status" style="display:none;"></div>
+        </div>
+
+        <div class="settings-card" style="animation-delay: 0.35s">
           <div class="settings-card-title">Informacje</div>
           <div class="settings-card-desc">
-            <strong>Biedronka Promo Hunter</strong> v1.0<br>
+            <strong>Biedronka Promo Hunter</strong> v2.0<br>
             Wyszukiwarka promocji w gazetkach Biedronki z OCR.<br>
-            Silnik: Dual-Scan (standardowy + snajper) z cache FTS5.
+            Silnik: RapidOCR / PP-OCRv5 latin na DirectML, indeks SQLite FTS5.
           </div>
         </div>
 
@@ -184,6 +184,16 @@
       </div>
     </section>
   </main>
+
+  <!-- Indexing strip: OCR runs in the background, search stays usable -->
+  <div class="index-strip" id="index-strip">
+    <div class="index-strip-bar"><div class="index-strip-fill" id="index-fill"></div></div>
+    <div class="index-strip-row">
+      <span class="index-strip-dot" id="index-dot"></span>
+      <span class="index-strip-text" id="index-text">Uruchamiam indekser...</span>
+      <span class="index-strip-count" id="index-count"></span>
+    </div>
+  </div>
 
   <!-- Lightbox -->
   <div class="lightbox" id="lightbox">
